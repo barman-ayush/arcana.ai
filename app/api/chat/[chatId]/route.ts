@@ -7,48 +7,6 @@ import { MemoryManager } from "@/lib/memory";
 import { ratelimit } from "@/lib/rate-limit";
 import prismadb from "@/lib/prismadb";
 
-interface ChatRouteParams {
-  params: {
-    chatId: string
-  }
-}
-
-const createPromptTemplate = (
-  name: string,
-  instructions: string,
-  messageHistory: string,
-  isRepetitive: boolean,
-  lastResponse: string,
-  prompt: string
-) => {
-  // Extract last 5 messages from messageHistory
-  const recentMessages = messageHistory.split('\n')
-    .slice(-10)  // Get last 10 lines to ensure we get ~5 messages
-    .filter(line => line.trim().length > 0)
-    .slice(-5);  // Take last 5 actual messages
-
-  return `<|system|>
-You are ${name}. Stay focused on the current topic of discussion.
-
-Core Identity:
-${instructions}
-
-CONVERSATION HISTORY (Last 5 exchanges):
-${recentMessages.join('\n')}
-
-CURRENT TOPIC: ${prompt}
-
-RULES:
-1. STAY ON TOPIC: The user is asking about ${prompt}. Do NOT talk about yourself unless specifically asked
-2. NO REPETITION: Don't repeat phrases from your recent messages shown above
-3. MEMORY ACTIVE: Reference the conversation history to maintain context
-4. FOCUSED RESPONSE: Address the current question directly
-
-Current question: ${prompt}
-Response as ${name}, focusing ONLY on the asked topic:
-<|assistant|>`;
-};
-
 const CONFIG = {
   TIMEOUT_MS: 30000,
   MAX_LENGTH: 512,
@@ -57,6 +15,33 @@ const CONFIG = {
   }
 } as const;
 
+// Pre-compile word analysis functions
+const createWordMap = (words: string[]) => {
+  const wordMap = new Map();
+  words.forEach(word => {
+    wordMap.set(word, (wordMap.get(word) || 0) + 1);
+  });
+  return wordMap;
+};
+
+const analyzeMessageSimilarity = (msg: string, prompt: string): boolean => {
+  if (!msg) return false;
+
+  const msgWords = msg.toLowerCase().split(" ").filter(word => word.length > 0);
+  const promptWords = prompt.toLowerCase().split(" ").filter(word => word.length > 0);
+
+  const msgWordMap = createWordMap(msgWords);
+  const promptWordMap = createWordMap(promptWords);
+
+  let commonWords = 0;
+  msgWordMap.forEach((count, word) => {
+    if (promptWordMap.has(word)) {
+      commonWords += Math.min(count, promptWordMap.get(word) || 0);
+    }
+  });
+
+  return commonWords / Math.max(msgWords.length, promptWords.length) > 0.6;
+};
 
 export async function POST(request: Request, { params }: { params: any}) {
   const controller = new AbortController();
@@ -64,7 +49,6 @@ export async function POST(request: Request, { params }: { params: any}) {
 
   try {
     const chatId = (await params).chatId; 
-
     const { prompt } = await request.json();
     const user = await currentUser();
 
@@ -72,22 +56,23 @@ export async function POST(request: Request, { params }: { params: any}) {
       return new NextResponse("Unauthorized", { status: 401 });
     }
 
-    const identifier = `${request.url}-${user.id}`;
-    const [{ success }, companion] = await Promise.all([
-      ratelimit(identifier),
+    // Parallel execution of initial checks
+    const [rateLimitResult, companion, memoryManager] = await Promise.all([
+      ratelimit(`${request.url}-${user.id}`),
       prismadb.companion.findUnique({
         where: { id: chatId },
         include: {
           messages: {
             where: { userId: user.id },
             orderBy: { createdAt: "desc" },
-            take: 50
+            take: 10  // Reduced from 50 to improve initial load
           }
         }
-      })
+      }),
+      MemoryManager.getInstance()
     ]);
-    
-    if (!success) {
+
+    if (!rateLimitResult.success) {
       return new NextResponse("Rate limit exceeded", { status: 429 });
     }
     
@@ -95,8 +80,8 @@ export async function POST(request: Request, { params }: { params: any}) {
       return new NextResponse("Companion not found", { status: 404 });
     }
 
-
-    await prismadb.message.create({
+    // Create message in parallel with other operations
+    const messagePromise = prismadb.message.create({
       data: {
         content: prompt,
         role: "user",
@@ -104,136 +89,72 @@ export async function POST(request: Request, { params }: { params: any}) {
         companionId: companion.id
       }
     });
-    // Analyze recent messages for patterns
+
+    // Optimize message analysis
     const recentMessages = companion.messages || [];
-    const similarMessages = recentMessages.filter((msg) => {
-      if (!msg.content) return false;
+    const isRepetitive = recentMessages.some(msg => 
+      analyzeMessageSimilarity(msg.content || '', prompt)
+    );
+    const lastResponse = recentMessages[0]?.content || "";
 
-      // Split messages into word arrays
-      const msgWords: string[] = msg.content
-        .toLowerCase()
-        .split(" ")
-        .filter((word: string) => word.length > 0);
-      const promptWords: string[] = prompt
-        .toLowerCase()
-        .split(" ")
-        .filter((word: string) => word.length > 0);
-
-      // Create word frequency maps
-      const msgWordMap: Map<string, number> = new Map();
-      const promptWordMap: Map<string, number> = new Map();
-
-      // Count words in message
-      msgWords.forEach((word: string) => {
-        msgWordMap.set(word, (msgWordMap.get(word) || 0) + 1);
-      });
-
-      // Count words in prompt
-      promptWords.forEach((word: string) => {
-        promptWordMap.set(word, (promptWordMap.get(word) || 0) + 1);
-      });
-
-      // Count common words
-      let commonWords = 0;
-      msgWordMap.forEach((count: number, word: string) => {
-        if (promptWordMap.has(word)) {
-          const promptCount = promptWordMap.get(word);
-          if (promptCount !== undefined) {
-            commonWords += Math.min(count, promptCount);
-          }
-        }
-      });
-
-      // Calculate similarity ratio
-      const similarity =
-        commonWords / Math.max(msgWords.length, promptWords.length);
-      return similarity > 0.6;
-    });
-
-    // Determine conversation context
-    const isRepetitive = similarMessages.length > 0;
-    const lastResponse = similarMessages[0]?.content || "";
-
-    // Memory management
+    // Memory operations in parallel
     const companionKey = {
       companionName: companion.id,
       userId: user.id,
       modelName: "meta/meta-llama-3-8b-instruct"
     };
 
-    const memoryManager = await MemoryManager.getInstance();
-
     const [records, similarDocs] = await Promise.all([
       memoryManager.readLatestHistory(companionKey),
-      memoryManager.vectorSearch(
-        await memoryManager.readLatestHistory(companionKey),
-        `${companion.id}.txt`
-      )
+      memoryManager.vectorSearch(companion.id, `${companion.id}.txt`)
     ]);
 
+    // Conditional seeding only if necessary
     if (records.length === 0) {
       await memoryManager.seedChatHistory(companion.seed, "\n\n", companionKey);
     }
 
-    await memoryManager.writeToHistory(`User: ${prompt}\n`, companionKey);
-
-    const relevantHistory = similarDocs?.length
-      ? similarDocs.map((doc) => doc.pageContent).join("\n")
-      : "";
-
-    // Format message history for the prompt
+    // Format message history concisely
     const messageHistory = recentMessages
-      .map((msg) => `${msg.role === 'user' ? 'User' : companion.name}: ${msg.content}`)
+      .map(msg => `${msg.role === 'user' ? 'User' : companion.name}: ${msg.content}`)
       .reverse()
       .join("\n");
 
-    // Generate response with context-aware instructions
+    const relevantHistory = similarDocs?.length
+      ? similarDocs.map(doc => doc.pageContent).join("\n")
+      : "";
+
+    // Initialize Replicate early
     const replicate = new Replicate({
       auth: process.env.REPLICATE_API_TOKEN!
     });
 
-    const buildPromptContent = (
-      companion: any,
-      messageHistory: string,
-      relevantHistory: string,
-      lastResponse: string,
-      isRepetitive: boolean,
-      currentPrompt: string
-    ) => {
-      return createPromptTemplate(
-        companion.name,
-        companion.instructions,
-        messageHistory,
-        isRepetitive,
-        lastResponse,
-        currentPrompt
-      );
-    };
+    // Wait for message creation to complete
+    await messagePromise;
 
+    // Generate response with optimized prompt
     const modelResponse = await replicate.run(CONFIG.MODELS.default, {
       input: {
-        prompt: buildPromptContent(
-          companion,
-          messageHistory,
-          relevantHistory,
-          lastResponse,
-          isRepetitive,
-          prompt
-        ),
-        temperature: 0.98,  // Increased for more variation
+        prompt: `<|system|>
+You are ${companion.name}. Focus on: ${prompt}
+${companion.instructions}
+Recent context:
+${messageHistory}
+Current question: ${prompt}
+<|assistant|>`,
+        temperature: 0.98,
         max_tokens: CONFIG.MAX_LENGTH,
         top_p: 0.95,
-        presence_penalty: 1.8  // Added to discourage repetition
+        presence_penalty: 1.8
       }
     });
-    const response = String(modelResponse);
-    const cleaned = response.replaceAll(",", "");
-    const chunks = cleaned.split("\n");
-    const finalResponse = chunks[0];
+
+    const finalResponse = String(modelResponse).split("\n")[0];
 
     if (finalResponse?.length > 1) {
+      // Update history and create response message in parallel
       await Promise.all([
-        memoryManager.writeToHistory(finalResponse.trim(), companionKey),
+        memoryManager.writeToHistory(`User: ${prompt}\n${finalResponse.trim()}`, companionKey),
         prismadb.companion.update({
           where: { id: chatId },
           data: {
